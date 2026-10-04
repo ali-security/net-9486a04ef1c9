@@ -1,0 +1,124 @@
+# Upstream golang.org/x/net has no GitHub Actions CI (it is tested on the Go
+# project's own TryBot/LUCI infrastructure), so this workflow is written from
+# scratch. It packages the module zip exactly as the module proxy does and runs
+# the project's own test suite (`go test ./...`) on Linux, macOS and Windows.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: Space-separated top-level test names to run instead of the full suite
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+
+      # Build the packaging helper in its own module OUTSIDE the checkout, so
+      # `go get` never touches this repository's go.mod/go.sum.
+      - name: Build module-zip helper
+        run: |
+          set -eux
+          HELPER=$(mktemp -d)
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/"
+          cd "$HELPER"
+          go mod init example.com/mod
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+
+      # golang.org/x/mod/zip skips .git but DESCENDS into .github, so this
+      # workflow would otherwise leak into the zip as extra entries that the
+      # public proxy artifact does not have. .gitignore and .gitattributes are
+      # kept: they ARE part of the published module zip.
+      - name: Create module zip
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/out"
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          "$RUNNER_TEMP/create_mod" \
+            golang.org/x/net v0.45.0 \
+            "$GITHUB_WORKSPACE" \
+            "$RUNNER_TEMP/out/v0.45.0.zip"
+          unzip -l "$RUNNER_TEMP/out/v0.45.0.zip" | tail -5
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.45.0.zip
+          if-no-files-found: error
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      # go.mod declares go 1.24.0. On Go 1.24 the synctest-based http2 and
+      # internal/http3 tests are behind `//go:build goexperiment.synctest`;
+      # without this experiment those suites (including http2/transport_test.go)
+      # are silently compiled out.
+      GOEXPERIMENT: synctest
+      GOTOOLCHAIN: local
+    defaults:
+      run:
+        # Windows would otherwise default to pwsh, where `set -eux` fails.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Build
+        run: |
+          set -eux
+          go version
+          go env GOEXPERIMENT
+          go build ./...
+
+      # -v so every test's PASS/FAIL/SKIP line is in the log; the summary step
+      # below prints the totals. A non-empty test-filter runs only the named
+      # top-level tests, and fails if any of them did not run.
+      - name: Test
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -euo pipefail
+          if [ -n "$TEST_FILTER" ]; then
+            go test -v -run "^($(echo "$TEST_FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+            for t in $TEST_FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/test.log" || { echo "selected test ${t} did not run"; exit 1; }
+            done
+          else
+            go test -v ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+          fi
+
+      - name: Test summary
+        if: always()
+        run: |
+          set -eu
+          awk '
+            /^--- PASS/ {tp++} /^--- FAIL/ {tf++} /^--- SKIP/ {ts++}
+            /^[[:space:]]*--- PASS/ {ap++} /^[[:space:]]*--- FAIL/ {af++} /^[[:space:]]*--- SKIP/ {as++}
+            /^ok[[:space:]]/ {pok++} /^FAIL[[:space:]]/ {pfail++}
+            END {
+              printf "Test summary (top-level tests): %d passed, %d failed, %d skipped\n", tp, tf, ts
+              printf "Test summary (including subtests): %d passed, %d failed, %d skipped\n", ap, af, as
+              printf "Packages: %d ok, %d FAIL\n", pok, pfail
+            }' "$RUNNER_TEMP/test.log"
